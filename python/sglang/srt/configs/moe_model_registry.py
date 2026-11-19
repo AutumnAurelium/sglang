@@ -18,6 +18,7 @@ class _DeepEPv2ModelPolicy(msgspec.Struct, frozen=True):
 
 
 _DEEPEP_V2_MODELS: dict[str, _DeepEPv2ModelPolicy] = {
+    "AfmoeForCausalLM": _DeepEPv2ModelPolicy(),
     "DeepseekV3ForCausalLM": _DeepEPv2ModelPolicy(),
     "DeepseekV4ForCausalLM": _DeepEPv2ModelPolicy(),
     "Qwen3MoeForCausalLM": _DeepEPv2ModelPolicy(),

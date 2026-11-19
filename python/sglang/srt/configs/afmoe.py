@@ -8,32 +8,32 @@ class AfmoeConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size: int = 32000,
-        hidden_size: int = 4096,
-        intermediate_size: int = 11008,
-        moe_intermediate_size: int = 256,
+        vocab_size: int = 200192,
+        hidden_size: int = 2048,
+        intermediate_size: int = 6144,
+        moe_intermediate_size: int = 1408,
         num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
+        num_attention_heads: int = 16,
         num_key_value_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
         hidden_act: str = "silu",
-        max_position_embeddings: int = 131072,
+        max_position_embeddings: int = 16384,
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1e-5,
         use_cache: bool = True,
         pad_token_id: Optional[int] = None,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
+        bos_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
         tie_word_embeddings: bool = False,
         rope_theta: float = 10000.0,
         rope_scaling: Optional[dict] = None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         # MoE parameters
-        num_experts: Optional[int] = None,
-        num_experts_per_tok: Optional[int] = None,
-        num_shared_experts: int = 0,
-        num_dense_layers: int = 0,
+        num_experts: Optional[int] = 64,
+        num_experts_per_tok: Optional[int] = 6,
+        num_shared_experts: int = 2,
+        num_dense_layers: int = 1,
         # Routing parameters
         score_func: str = "sigmoid",
         route_norm: bool = True,
@@ -41,7 +41,7 @@ class AfmoeConfig(PretrainedConfig):
         n_group: int = 1,
         topk_group: int = 1,
         # Attention parameters
-        sliding_window: Optional[int] = None,
+        sliding_window: Optional[int] = 1024,
         layer_types: Optional[List[str]] = None,
         global_attn_every_n_layers: int = 4,
         # muP scaling
@@ -87,8 +87,17 @@ class AfmoeConfig(PretrainedConfig):
 
         # Attention parameters
         self.sliding_window = sliding_window
-        self.layer_types = layer_types
         self.global_attn_every_n_layers = global_attn_every_n_layers
+        if layer_types is None:
+            layer_types = [
+                (
+                    "sliding_attention"
+                    if (layer_id + 1) % global_attn_every_n_layers
+                    else "full_attention"
+                )
+                for layer_id in range(num_hidden_layers)
+            ]
+        self.layer_types = layer_types
 
         # muP scaling
         self.mup_enabled = mup_enabled
