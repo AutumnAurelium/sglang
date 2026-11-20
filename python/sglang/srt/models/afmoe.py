@@ -32,7 +32,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -45,8 +45,6 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
-    LinearParallelGroup,
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -58,7 +56,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
-    adds_replicated_output_to_partial,
     filter_moe_weight_param_global_expert,
     get_num_fused_shared_experts,
     has_per_rank_fused_shared_slots,
@@ -68,7 +65,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -76,9 +73,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.auto_loader import (
+    STANDARD_QKV_MAPPING,
+    StackedParamsDispatch,
+    filter_pp_weights,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_lora, get_model, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import LazyValue, is_cpu, is_cuda
 
 
@@ -93,55 +96,10 @@ def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]
 
 
 def is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
-    if not config.num_experts or not 0 <= layer_id < config.num_hidden_layers:
-        return False
-    if hasattr(config, "num_dense_layers"):
-        return layer_id >= config.num_dense_layers
-    if hasattr(config, "first_k_dense_replace") and hasattr(config, "moe_layer_freq"):
-        base = config.first_k_dense_replace
-        return layer_id >= base and (layer_id - base) % config.moe_layer_freq == 0
-    return False
-
-
-class AfmoeMLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
-        parallel_group: LinearParallelGroup = "tp",
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-            parallel_group=parallel_group,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            reduce_results=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-            parallel_group=parallel_group,
-        )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+    return (
+        bool(config.num_experts)
+        and config.num_dense_layers <= layer_id < config.num_hidden_layers
+    )
 
 
 class AfmoeMoE(nn.Module):
@@ -154,10 +112,8 @@ class AfmoeMoE(nn.Module):
     ):
         super().__init__()
         num_experts = config.num_experts
-        if config.score_func != "sigmoid":
-            raise ValueError(
-                f"AFMoE requires sigmoid routing, got {config.score_func!r}"
-            )
+        if config.score_func not in ("sigmoid", "softmax"):
+            raise ValueError(f"Unknown AFMoE routing function {config.score_func!r}")
         num_fused = get_num_fused_shared_experts()
         self.num_fused_shared_experts = num_fused
         shared_slots = (
@@ -200,12 +156,14 @@ class AfmoeMoE(nn.Module):
         # contribute exactly once, just like the separate shared MLP.
         self.route_scale = config.route_scale
         self.scale_after_experts = is_cpu()
+        sigmoid = config.score_func == "sigmoid"
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
-            scoring_func="sigmoid",
-            renormalize=config.route_norm,
-            use_grouped_topk=(config.n_group or 1) > 1,
+            scoring_func=config.score_func,
+            custom_routing_function=None if sigmoid else self._softmax_topk,
+            renormalize=sigmoid and config.route_norm,
+            use_grouped_topk=sigmoid and (config.n_group or 1) > 1,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.expert_bias,
@@ -219,16 +177,24 @@ class AfmoeMoE(nn.Module):
         )
 
         self.shared_experts = None
-        self.shared_replicated = is_moe_input_scattered_across_dp_ranks()
         if config.num_shared_experts and not num_fused:
-            self.shared_experts = AfmoeMLP(
+            self.shared_experts = Qwen2MoeMLP(
                 config.hidden_size,
                 config.moe_intermediate_size * config.num_shared_experts,
                 config.hidden_act,
                 quant_config=quant_config,
-                parallel_group="replicated" if self.shared_replicated else "tp",
+                reduce_results=False,
+                parallel_group=(
+                    "replicated" if is_moe_input_scattered_across_dp_ranks() else "tp"
+                ),
                 prefix=add_prefix("shared_experts", prefix),
             )
+
+    def _softmax_topk(self, hidden_states, gating_output, topk, renormalize):
+        # Legacy Trinity routers use the bias for selection only.
+        scores = gating_output.softmax(dim=-1, dtype=torch.float32)
+        ids = (scores + self.expert_bias).topk(topk, dim=-1).indices
+        return scores.gather(-1, ids), ids.int()
 
     def get_moe_weights(self):
         # EPLB may move routed experts, but never the fixed shared slots.
@@ -245,9 +211,7 @@ class AfmoeMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0]:
-            if self.shared_experts is not None and (
-                not self.shared_replicated or adds_replicated_output_to_partial()
-            ):
+            if self.shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
             logits, _ = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, logits)
@@ -265,86 +229,67 @@ class AfmoeAttention(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        layer_id: int = 0,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
-        tp_size = get_parallel().attn_tp_size
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-
-        self.head_dim = getattr(config, "head_dim", hidden_size // self.total_num_heads)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        self.rotary_dim = int(self.head_dim * partial_rotary_factor)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-
-        layer_types = getattr(config, "layer_types", None)
-        self.is_local_attention = (
-            layer_types is not None and layer_types[layer_id] == "sliding_attention"
-        )
-        sliding_window = (
-            get_attention_sliding_window_size(config) if self.is_local_attention else -1
-        )
-
+        self.head_dim = config.head_dim
         self.qkv_proj = QKVParallelLinear(
-            hidden_size,
+            config.hidden_size,
             self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=getattr(config, "attention_bias", False),
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            bias=config.attention_bias,
             quant_config=quant_config,
             parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
+        self.qkv_sizes = (
+            self.qkv_proj.q_proj_shard_size,
+            self.qkv_proj.kv_proj_shard_size,
+            self.qkv_proj.v_proj_shard_size,
+        )
+        attention_size = config.num_attention_heads * self.head_dim
         self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=getattr(config, "attention_bias", False),
+            attention_size,
+            config.hidden_size,
+            bias=config.attention_bias,
             quant_config=quant_config,
             reduce_results=False,
             parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
         self.gate_proj = ColumnParallelLinear(
-            hidden_size,
-            self.total_num_heads * self.head_dim,
+            config.hidden_size,
+            attention_size,
             bias=False,
             quant_config=quant_config,
             parallel_group="attn_tp",
             prefix=add_prefix("gate_proj", prefix),
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.rotary_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=True,
-        )
+        sliding_window = -1
+        self.rotary_emb = None
+        if config.layer_types[layer_id] == "sliding_attention":
+            sliding_window = get_attention_sliding_window_size(config)
+            base, rope_scaling = get_rope_config(config)
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=config.max_position_embeddings,
+                base=base,
+                rope_scaling=rope_scaling,
+                partial_rotary_factor=(rope_scaling or {}).get(
+                    "partial_rotary_factor",
+                    getattr(config, "partial_rotary_factor", 1.0),
+                ),
+            )
         self.attn = RadixAttention(
-            self.num_heads,
+            self.qkv_proj.num_heads,
             self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
+            self.head_dim**-0.5,
+            num_kv_heads=self.qkv_proj.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window,
             quant_config=quant_config,
@@ -354,7 +299,6 @@ class AfmoeAttention(nn.Module):
         eps = getattr(config, "rms_norm_eps", 1e-5)
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
-        self.sliding_window = sliding_window
 
     def forward(
         self,
@@ -365,7 +309,7 @@ class AfmoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = qkv.split(self.qkv_sizes, dim=-1)
         q, k = apply_qk_norm(
             q=q,
             k=k,
@@ -374,7 +318,7 @@ class AfmoeAttention(nn.Module):
             head_dim=self.head_dim,
         )
 
-        if self.is_local_attention:
+        if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -393,15 +337,9 @@ class AfmoeDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.layer_id = layer_id
 
         self.self_attn = AfmoeAttention(
             config=config,
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
@@ -415,12 +353,13 @@ class AfmoeDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            self.mlp = AfmoeMLP(
+            self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
                 parallel_group="replicated" if is_dense_ffn_fully_dp() else "tp",
             )
 
@@ -464,8 +403,6 @@ class AfmoeDecoderLayer(nn.Module):
 
 
 class AfmoeModel(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -474,8 +411,6 @@ class AfmoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
 
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
@@ -548,10 +483,6 @@ class AfmoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if get_lora().enable_lora or get_lora().lora_paths:
-            raise ValueError("AFMoE LoRA cannot map the separate attention gate.")
-        if get_model().kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2", "mxfp8"):
-            raise ValueError("AFMoE does not load FP8 KV-cache scales.")
         self.config = config
         self.quant_config = quant_config
         self.model = AfmoeModel(
@@ -576,7 +507,7 @@ class AfmoeForCausalLM(nn.Module):
             lambda: {
                 i: self.model.layers[i].mlp.get_moe_weights()
                 for i in range(self.start_layer, self.end_layer)
-                if is_moe_layer(config, i)
+                if isinstance(self.model.layers[i].mlp, AfmoeMoE)
             }
         )
 
@@ -602,6 +533,8 @@ class AfmoeForCausalLM(nn.Module):
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.score_func == "softmax":
+            return "The legacy softmax router selects routed experts only."
         if hf_config.num_shared_experts != 1:
             return "AFMoE shared expert fusion requires one shared expert."
         if not is_cuda() or torch.cuda.get_device_capability() < (8, 0):
@@ -627,7 +560,7 @@ class AfmoeForCausalLM(nn.Module):
         return None
 
     def get_input_embeddings(self) -> nn.Embedding:
-        return self.model.embed_tokens
+        return self.model.get_input_embeddings()
 
     def forward(
         self,
@@ -649,42 +582,45 @@ class AfmoeForCausalLM(nn.Module):
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_attention_sliding_window_size(self.config)
 
-    def _unpack_expert_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # Transformers stores all routed experts in two 3-D parameters. Feed
-        # their views through the same TP/EP loader as per-expert checkpoints.
-        for name, weight in weights:
-            prefix, _, projection = name.removesuffix(".weight").rpartition(".")
-            if not prefix.endswith(".mlp.experts") or projection not in (
-                "gate_up_proj",
-                "down_proj",
-            ):
-                yield name, weight
-                continue
-            shards = (
-                ("gate_proj", "up_proj")
-                if projection == "gate_up_proj"
-                else ("down_proj",)
-            )
-            if (
-                weight.ndim != 3
-                or weight.shape[0] != self.config.num_experts
-                or weight.shape[1] % len(shards)
-            ):
-                raise ValueError(f"Invalid packed expert tensor {name}: {weight.shape}")
-            for shard, expert_weights in zip(shards, weight.chunk(len(shards), dim=1)):
-                for expert_id, expert_weight in enumerate(expert_weights.unbind()):
-                    yield f"{prefix}.{expert_id}.{shard}.weight", expert_weight
+    def _load_packed_experts(self, name, weight, params):
+        # Transformers packs all experts along dimension 0 and gate/up along
+        # dimension 1, for both the weights and their blockwise FP8 scales.
+        match = re.fullmatch(
+            r"(.+\.mlp\.experts)\.(gate_up_proj|down_proj)(?:\.weight)?(_scale_inv)?",
+            name,
+        )
+        if match is None:
+            return False
+        prefix, projection, scale_suffix = match.groups()
+        if projection == "gate_up_proj":
+            target, shards = "w13_weight", ("w1", "w3")
+        else:
+            target, shards = "w2_weight", ("w2",)
+        if (
+            weight.ndim != 3
+            or weight.shape[0] != self.config.num_experts
+            or weight.shape[1] % len(shards)
+        ):
+            raise ValueError(f"Invalid packed expert tensor {name}: {weight.shape}")
+        dest = f"{prefix}.{target}{scale_suffix or ''}"
+        param = params[dest]
+        for shard, expert_weights in zip(shards, weight.chunk(len(shards), dim=1)):
+            for expert_id, expert_weight in enumerate(expert_weights.unbind()):
+                param.weight_loader(
+                    param, expert_weight, dest, expert_id=expert_id, shard_id=shard
+                )
+        return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        stacked_params_mapping = [
-            (".self_attn.qkv_proj.", ".self_attn.q_proj.", "q"),
-            (".self_attn.qkv_proj.", ".self_attn.k_proj.", "k"),
-            (".self_attn.qkv_proj.", ".self_attn.v_proj.", "v"),
-            (".mlp.gate_up_proj.", ".mlp.gate_proj.", 0),
-            (".mlp.gate_up_proj.", ".mlp.up_proj.", 1),
-            (".shared_experts.gate_up_proj.", ".shared_experts.gate_proj.", 0),
-            (".shared_experts.gate_up_proj.", ".shared_experts.up_proj.", 1),
-        ]
+        stacked = StackedParamsDispatch(
+            mappings=STANDARD_QKV_MAPPING.mappings
+            + (
+                (".mlp.gate_up_proj.", ".mlp.gate_proj.", 0),
+                (".mlp.gate_up_proj.", ".mlp.up_proj.", 1),
+                (".shared_experts.gate_up_proj.", ".shared_experts.gate_proj.", 0),
+                (".shared_experts.gate_up_proj.", ".shared_experts.up_proj.", 1),
+            )
+        )
         num_fused = self.num_fused_shared_experts
         expert_mapping = {
             entry[1]: entry
@@ -699,12 +635,10 @@ class AfmoeForCausalLM(nn.Module):
             r"experts\.\d+\.(?:gate_proj|up_proj|down_proj)\."
         )
         params = dict(self.named_parameters())
-        for name, weight in self._unpack_expert_weights(weights):
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and not self.start_layer <= layer_id < self.end_layer
-            ):
+        for name, weight in filter_pp_weights(
+            weights, self.start_layer, self.end_layer
+        ):
+            if self._load_packed_experts(name, weight, params):
                 continue
             if self.config.tie_word_embeddings:
                 if self.pp_group.is_first_rank and name == "lm_head.weight":
@@ -732,18 +666,9 @@ class AfmoeForCausalLM(nn.Module):
                     )
                 continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name in name:
-                    param = params.get(name.replace(weight_name, param_name))
-                    if param is not None:
-                        param.weight_loader(param, weight, shard_id)
-                    break
-            else:
-                if name in params:
-                    param = params[name]
-                    getattr(param, "weight_loader", default_weight_loader)(
-                        param, weight
-                    )
+            if stacked.try_load(name, weight, params) is None and name in params:
+                param = params[name]
+                getattr(param, "weight_loader", default_weight_loader)(param, weight)
 
 
 EntryClass = AfmoeForCausalLM
