@@ -78,7 +78,10 @@ from sglang.srt.model_loader.auto_loader import (
     StackedParamsDispatch,
     filter_pp_weights,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -112,6 +115,8 @@ class AfmoeMoE(nn.Module):
     ):
         super().__init__()
         num_experts = config.num_experts
+        if config.hidden_act != "silu":
+            raise ValueError(f"AFMoE experts require SiLU, got {config.hidden_act!r}")
         if config.score_func not in ("sigmoid", "softmax"):
             raise ValueError(f"Unknown AFMoE routing function {config.score_func!r}")
         num_fused = get_num_fused_shared_experts()
@@ -635,6 +640,7 @@ class AfmoeForCausalLM(nn.Module):
             r"experts\.\d+\.(?:gate_proj|up_proj|down_proj)\."
         )
         params = dict(self.named_parameters())
+        pending_router_tensors = {}
         for name, weight in filter_pp_weights(
             weights, self.start_layer, self.end_layer
         ):
@@ -650,6 +656,36 @@ class AfmoeForCausalLM(nn.Module):
                 ):
                     name = "lm_head.weight"
             name = name.replace(".mlp.router.gate.", ".mlp.gate.")
+            # The router runs in model precision. Serialized FP8 blocks and
+            # their inverse scales can arrive in either order across shards.
+            if name.endswith(".mlp.gate.weight_scale_inv") or (
+                name.endswith(".mlp.gate.weight")
+                and weight.dtype == torch.float8_e4m3fn
+            ):
+                from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+                gate_name = name.removesuffix("_scale_inv")
+                pending_router_tensors[name] = weight
+                scale_name = gate_name + "_scale_inv"
+                if (
+                    gate_name not in pending_router_tensors
+                    or scale_name not in pending_router_tensors
+                ):
+                    continue
+                param = params[gate_name]
+                block_size = getattr(self.quant_config, "weight_block_size", None)
+                if not block_size:
+                    raise ValueError(f"Missing FP8 weight_block_size for {gate_name}")
+                weight = block_quant_dequant(
+                    pending_router_tensors.pop(gate_name).to(param.device),
+                    pending_router_tensors.pop(scale_name).to(
+                        param.device, torch.float32
+                    ),
+                    block_size,
+                    param.dtype,
+                )
+                param.weight_loader(param, weight)
+                continue
             if num_fused:
                 name = name.replace(
                     ".mlp.shared_experts.", f".mlp.experts.{self.config.num_experts}."
@@ -666,9 +702,17 @@ class AfmoeForCausalLM(nn.Module):
                     )
                 continue
 
+            if name not in params:
+                name = maybe_remap_kv_scale_name(name, params)
+                if name is None:
+                    continue
             if stacked.try_load(name, weight, params) is None and name in params:
                 param = params[name]
                 getattr(param, "weight_loader", default_weight_loader)(param, weight)
+        if pending_router_tensors:
+            raise ValueError(
+                f"Incomplete FP8 router weight/scale pair: {sorted(pending_router_tensors)}"
+            )
 
 
 EntryClass = AfmoeForCausalLM

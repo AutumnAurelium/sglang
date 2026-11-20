@@ -3001,12 +3001,33 @@ def select_experts(
         fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=top_k_for_gate,
+            gating_output=(
+                router_logits.float()
+                if num_shared_topk_slots_for_gate
+                else router_logits
+            ),
+            topk=num_routed_topk,
             renormalize=renormalize,
             correction_bias=correction_bias,
             scoring_func=scoring_func,
         )
+        if num_shared_topk_slots_for_gate:
+            # Shared experts have no router logits and do not participate in renormalization.
+            shared_ids = torch.arange(
+                router_logits.shape[1],
+                router_logits.shape[1] + num_shared_topk_slots_for_gate,
+                device=topk_ids.device,
+                dtype=topk_ids.dtype,
+            ).expand(topk_ids.shape[0], -1)
+            topk_ids = torch.cat((topk_ids, shared_ids), dim=1).int()
+            topk_weights = F.pad(
+                topk_weights,
+                (0, num_shared_topk_slots_for_gate),
+                value=fused_shared_expert_weight(
+                    routed_scaling_factor=routed_scaling_factor,
+                    fused_in_topk=apply_routed_scaling_factor_on_output,
+                ),
+            )
     elif custom_routing_function is None:
         fold_scale_after_routing = scoring_func not in ("sqrtsoftplus", "sigmoid")
 
