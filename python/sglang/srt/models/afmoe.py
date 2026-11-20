@@ -84,7 +84,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 from sglang.srt.utils import LazyValue, is_cpu, is_cuda
 
 
@@ -538,6 +538,8 @@ class AfmoeForCausalLM(nn.Module):
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if get_lora().enable_lora:
+            return "AFMoE LoRA adapters require separate shared expert projections."
         if hf_config.score_func == "softmax":
             return "The legacy softmax router selects routed experts only."
         if hf_config.num_shared_experts != 1:
